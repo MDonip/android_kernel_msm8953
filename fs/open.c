@@ -33,6 +33,7 @@
 #include <linux/compat.h>
 
 #include "internal.h"
+#include <linux/susfs.h>
 
 int do_truncate2(struct vfsmount *mnt, struct dentry *dentry, loff_t length,
 		unsigned int time_attrs, struct file *filp)
@@ -1076,11 +1077,19 @@ struct file *filp_clone_open(struct file *oldfile)
 }
 EXPORT_SYMBOL(filp_clone_open);
 
+#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
+extern struct filename *susfs_open_redirect_spoof_do_sys_openat(struct inode *inode);
+#endif // #ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
+
 long do_sys_open(int dfd, const char __user *filename, int flags, umode_t mode)
 {
 	struct open_flags op;
 	int fd = build_open_flags(flags, mode, &op);
 	struct filename *tmp;
+#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
+	struct filename *fake_filename = NULL;
+	bool is_inode_open_redirect = false;
+#endif // #ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
 
 	if (fd)
 		return fd;
@@ -1090,8 +1099,27 @@ long do_sys_open(int dfd, const char __user *filename, int flags, umode_t mode)
 		return PTR_ERR(tmp);
 
 	fd = get_unused_fd_flags(flags);
+#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
+retry:
+#endif // #ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
 	if (fd >= 0) {
 		struct file *f = do_filp_open(dfd, tmp, &op);
+#ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
+		if (!is_inode_open_redirect && f && !IS_ERR(f)) {
+			struct inode *inode = file_inode(f);
+			if (inode && inode->i_mapping && unlikely(test_bit(AS_FLAGS_OPEN_REDIRECT, &inode->i_state))) {
+				
+				fake_filename = susfs_open_redirect_spoof_do_sys_openat(inode);
+				if (fake_filename && !IS_ERR(fake_filename)) {
+					is_inode_open_redirect = true;
+					filp_close(f, NULL);
+					putname(tmp);
+					tmp = fake_filename;
+					goto retry;
+				}
+			}
+		}
+#endif // #ifdef CONFIG_KSU_SUSFS_OPEN_REDIRECT
 		if (IS_ERR(f)) {
 			put_unused_fd(fd);
 			fd = PTR_ERR(f);
@@ -1103,7 +1131,6 @@ long do_sys_open(int dfd, const char __user *filename, int flags, umode_t mode)
 	putname(tmp);
 	return fd;
 }
-
 SYSCALL_DEFINE3(open, const char __user *, filename, int, flags, umode_t, mode)
 {
 	if (force_o_largefile())
